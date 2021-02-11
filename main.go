@@ -6,15 +6,18 @@ import (
 	"github.com/itchyny/gojq"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
-    "golang.org/x/oauth2/google"
+	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 	"google.golang.org/api/script/v1"
 	"google.golang.org/api/sheets/v4"
 	"io/ioutil"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 func check(msg string, err error) {
@@ -25,7 +28,7 @@ func check(msg string, err error) {
 
 var ctx = context.Background()
 
-func getTags(imagesSource string) [][]interface{} {
+func getImages(imagesSource string) [][]interface{} {
 	resp, err := http.Get(imagesSource)
 	check("Unable to query image source API: ", err)
 
@@ -54,15 +57,18 @@ func getTags(imagesSource string) [][]interface{} {
 		size := fmt.Sprintf("%.f", meta["size"].(float64))
 
 		tag := []interface{}{
-			meta["image_id"].(string), meta["name"].(string), meta["manifest_digest"].(string), size, meta["last_modified"].(string),
+			meta["image_id"].(string),
+			strings.ReplaceAll(meta["name"].(string), "-x86_64", ""),
+			meta["manifest_digest"].(string),
+			size,
+			meta["last_modified"].(string),
 		}
 		tags = append(tags, tag)
 	}
-
 	return tags
 }
 
-func updateSheet(serviceaccount string, sheet string, tags [][]interface{}) (status int, err error){
+func updateSheet(serviceaccount string, sheet string, images [][]interface{}) (status int, err error){
 	// Put images in Google Sheet
 	sheetsClient, err := sheets.NewService(
 		ctx,
@@ -70,16 +76,15 @@ func updateSheet(serviceaccount string, sheet string, tags [][]interface{}) (sta
 		option.WithScopes("https://www.googleapis.com/auth/spreadsheets"),
 	)
 	check("Unable to retrieve Google Sheets client: ", err)
-	// TODO: environment variable
 	sheetID := sheet
-	sheetRange := "imageSets!A1:E" + strconv.Itoa(len(tags))
-	images := sheets.ValueRange{
+	sheetRange := "imageSets!A1:E" + strconv.Itoa(len(images))
+	tags := sheets.ValueRange{
 		MajorDimension: "ROWS",
 		Range: sheetRange,
-		Values: tags,
+		Values: images,
 	}
 	currentImages := []*sheets.ValueRange{
-		&images,
+		&tags,
 	}
 
 	batchUpdate := sheets.BatchUpdateValuesRequest{
@@ -92,6 +97,38 @@ func updateSheet(serviceaccount string, sheet string, tags [][]interface{}) (sta
 		return updateStatus.HTTPStatusCode, err
 	}
 	return updateStatus.HTTPStatusCode, nil
+}
+
+func sortSheet(serviceaccount string, sheet string) (status int, err error){
+	sheetsClient, err := sheets.NewService(
+		ctx,
+		option.WithCredentialsFile(serviceaccount),
+		option.WithScopes("https://www.googleapis.com/auth/spreadsheets"),
+	)
+	check("Unable to retrieve Google Sheets client: ", err)
+	sheetID := sheet
+	sortRangeRequest := sheets.SortRangeRequest{
+		Range: &sheets.GridRange{
+			EndColumnIndex:   4,
+			SheetId:          0,
+			StartColumnIndex: 0,
+			StartRowIndex:    1,
+		},
+		SortSpecs: []*sheets.SortSpec{
+			{DimensionIndex: 1, SortOrder: "DESCENDING"},
+		},
+	}
+	requests := sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{
+			{SortRange: &sortRangeRequest},
+		},
+	}
+	sortSheetStatus, err := sheetsClient.Spreadsheets.BatchUpdate(sheetID, &requests).Do()
+	check("Unable to sort sheet: ", err)
+	if err != nil {
+		return sortSheetStatus.HTTPStatusCode, err
+	}
+	return sortSheetStatus.HTTPStatusCode, nil
 }
 
 func updateForm(credentials, token, form string) (status int, err error){
@@ -127,25 +164,54 @@ func updateForm(credentials, token, form string) (status int, err error){
 	return scriptsRunStatus.HTTPStatusCode, err
 }
 
+func updateClusterImageSets(images [][]interface{}) (status int, err error){
+	cfg, err := clientcmd.BuildConfigFromFlags("", os.Getenv("OPENSHIFT_KUBECONFIG"))
+	check("The kubeconfig could not be loaded", err)
+	_, err = kubernetes.NewForConfig(cfg)
+
+	names := make([]string, 1)
+	for _, i := range images {
+		if i[1] == "name" {
+			continue
+		}
+		names = append(names, strings.ReplaceAll(i[1].(string), "-x86_64", ""))
+	}
+
+	return 200, nil
+}
+
 func main() {
-	// Get latest images from source
-	tags := getTags(os.Getenv("IMAGE_SOURCE"))
+	images := getImages(os.Getenv("IMAGE_SOURCE"))
 
 	updateSheetStatus, err := updateSheet(
 		os.Getenv("GOOGLE_SERVICE_ACCOUNT"),
 		os.Getenv("GOOGLE_SHEET_ID"),
-		tags)
+		images)
 	if err != nil {
-		log.Fatalf("Unable to update Google Sheet: %v", err)
+		log.Fatalf("Unable to update Google Sheet: Status(%v) %v\n", updateSheetStatus, err)
 	}
+	log.Println("Updated Google Sheet Successfully")
 
-	if updateSheetStatus == 200 {
-		updateFormStatus, err := updateForm(
-			os.Getenv("GOOGLE_CREDENTIALS"),
-			os.Getenv("GOOGLE_TOKEN"),
-			os.Getenv("GOOGLE_FORM_ID"))
-		if err != nil {
-			log.Fatalf("Unable to update Google Form: Status(%v) %v", updateFormStatus, err)
-		}
+	sortSheetStatus, err := sortSheet(
+		os.Getenv("GOOGLE_SERVICE_ACCOUNT"),
+		os.Getenv("GOOGLE_SHEET_ID"))
+	if err != nil {
+		log.Fatalf("Unable to sort Google Sheet: Status(%v) %v\n", sortSheetStatus, err)
 	}
+	log.Println("Sorted Google Sheet Successfully")
+
+	updateFormStatus, err := updateForm(
+		os.Getenv("GOOGLE_CREDENTIALS"),
+		os.Getenv("GOOGLE_TOKEN"),
+		os.Getenv("GOOGLE_FORM_ID"))
+	if err != nil {
+		log.Fatalf("Unable to update Google Form: Status(%v) %v\n", updateFormStatus, err)
+	}
+	log.Println("Updated Google Form Successfully")
+    // TODO: Create ClusterImageSets from name column of Google Sheet
+	//updateClusterImageSetsStatus, err := updateClusterImageSets(images)
+	//if err != nil {
+	//	log.Fatalf("Unable to update ClusterImageSets: Status(%v) %v\n", updateClusterImageSetsStatus, err)
+	//}
+	//log.Println("Updated ClusterImageSets Successfully")
 }
