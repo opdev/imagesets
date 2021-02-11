@@ -1,0 +1,7 @@
+.google
+.google/
+.google/*
+.idea
+.idea/
+.idea/*
+/*.go_
