@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/itchyny/gojq"
+	. "github.com/opdev/imagesets/libs"
+	hive "github.com/openshift/hive/pkg/apis/hive/v1"
 	"golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -11,11 +13,12 @@ import (
 	"google.golang.org/api/script/v1"
 	"google.golang.org/api/sheets/v4"
 	"io/ioutil"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"log"
 	"net/http"
 	"os"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"strconv"
 	"strings"
 )
@@ -68,7 +71,7 @@ func getImages(imagesSource string) [][]interface{} {
 	return tags
 }
 
-func updateSheet(serviceaccount string, sheet string, images [][]interface{}) (status int, err error){
+func updateSheet(serviceaccount string, sheet string, images [][]interface{}) (status int, err error) {
 	// Put images in Google Sheet
 	sheetsClient, err := sheets.NewService(
 		ctx,
@@ -99,7 +102,7 @@ func updateSheet(serviceaccount string, sheet string, images [][]interface{}) (s
 	return updateStatus.HTTPStatusCode, nil
 }
 
-func sortSheet(serviceaccount string, sheet string) (status int, err error){
+func sortSheet(serviceaccount string, sheet string) (status int, err error) {
 	sheetsClient, err := sheets.NewService(
 		ctx,
 		option.WithCredentialsFile(serviceaccount),
@@ -131,7 +134,7 @@ func sortSheet(serviceaccount string, sheet string) (status int, err error){
 	return sortSheetStatus.HTTPStatusCode, nil
 }
 
-func updateForm(credentials, token, form string) (status int, err error){
+func updateForm(credentials, token, form string) (status int, err error) {
 	credentialsFileBytes, err := ioutil.ReadFile(credentials)
 	check("Unable to read credentials file: ", err)
 
@@ -164,20 +167,52 @@ func updateForm(credentials, token, form string) (status int, err error){
 	return scriptsRunStatus.HTTPStatusCode, err
 }
 
-func updateClusterImageSets(images [][]interface{}) (status int, err error){
-	cfg, err := clientcmd.BuildConfigFromFlags("", os.Getenv("OPENSHIFT_KUBECONFIG"))
-	check("The kubeconfig could not be loaded", err)
-	_, err = kubernetes.NewForConfig(cfg)
+func updateClusterImageSets(images [][]interface{}) {
+	cfg, err := DefaultK8sAuthenticate()
+	check("Unable to create dynamic client: %v\n", err)
 
-	names := make([]string, 1)
+	scheme := runtime.NewScheme()
+	err = hive.SchemeBuilder.AddToScheme(scheme)
+	check("Unable to add hive to scheme: %v\n", err)
+
+	dc, err := client.New(cfg, client.Options{Scheme: scheme})
+	check("Unable to create K8s client: %v\n", err)
+
+	cisl := &hive.ClusterImageSetList{}
+	err = dc.List(context.Background(), cisl)
+	check("Unable to list ClusterImageSets: %v\n", err)
+
+	currentcis := make([]string, 1)
+	for _, v := range cisl.Items {
+		currentcis = append(currentcis, v.Spec.ReleaseImage)
+	}
+
 	for _, i := range images {
 		if i[1] == "name" {
 			continue
 		}
-		names = append(names, strings.ReplaceAll(i[1].(string), "-x86_64", ""))
-	}
 
-	return 200, nil
+		for _, v := range currentcis {
+			if i[1] == v {
+				continue
+			}
+		}
+
+		imageset := hive.ClusterImageSet{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "ocp-" + strings.ReplaceAll(i[1].(string), "-x86_64", ""),
+			},
+			Spec:       hive.ClusterImageSetSpec{
+				ReleaseImage: "quay.io/openshift-release-dev/ocp-release:" + i[1].(string),
+			},
+		}
+
+		err = dc.Create(context.Background(), &imageset)
+		if err != nil {
+			log.Printf("Unable to create ClusterImageSet: %v\n", err)
+			continue
+		}
+	}
 }
 
 func main() {
@@ -208,10 +243,7 @@ func main() {
 		log.Fatalf("Unable to update Google Form: Status(%v) %v\n", updateFormStatus, err)
 	}
 	log.Println("Updated Google Form Successfully")
-    // TODO: Create ClusterImageSets from name column of Google Sheet
-	//updateClusterImageSetsStatus, err := updateClusterImageSets(images)
-	//if err != nil {
-	//	log.Fatalf("Unable to update ClusterImageSets: Status(%v) %v\n", updateClusterImageSetsStatus, err)
-	//}
-	//log.Println("Updated ClusterImageSets Successfully")
+
+	updateClusterImageSets(images)
+	log.Println("Updated ClusterImageSets Successfully")
 }
