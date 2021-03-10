@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"github.com/itchyny/gojq"
 	. "github.com/opdev/imagesets/libs"
 	hive "github.com/openshift/hive/pkg/apis/hive/v1"
@@ -57,13 +56,13 @@ func getImages(imagesSource string) [][]interface{} {
 
 	for _, imageMeta := range imageSet.(map[string]interface{}) {
 		meta := imageMeta.(map[string]interface{})
-		size := fmt.Sprintf("%.f", meta["size"].(float64))
+		//size := fmt.Sprintf("%.f", meta["size"].(float64))
 
 		tag := []interface{}{
 			meta["image_id"].(string),
 			strings.ReplaceAll(meta["name"].(string), "-x86_64", ""),
 			meta["manifest_digest"].(string),
-			size,
+			meta["size"],
 			meta["last_modified"].(string),
 		}
 		tags = append(tags, tag)
